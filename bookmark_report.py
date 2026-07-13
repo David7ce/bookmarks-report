@@ -7,12 +7,16 @@ container (Bookmark Bar, Bookmarks Toolbar, Other Bookmarks, ...) stripped
 before comparing, so the same subfolder nested under different root names
 still matches across browsers -- root containers aren't real user-created
 folders anyway. Firefox's hidden "tags" folder is excluded entirely --
-Chromium has no equivalent.
+Chromium has no equivalent. The "☁️" and "👤" folders are also excluded
+entirely (in both browsers) -- they're hand-curated cross-references of
+bookmarks that already live elsewhere, so counting them would just report
+false duplicates.
 """
 import argparse
 import configparser
 import json
 import os
+import re
 import sqlite3
 import sys
 from collections import Counter
@@ -26,20 +30,34 @@ FIREFOX_ROOT_NAMES = {
     "mobile______": "Mobile Bookmarks",
 }
 
+# Hand-curated folders that mirror bookmarks already classified elsewhere --
+# excluded entirely so they don't show up as bogus duplicates.
+EXCLUDED_FOLDER_TITLES = ("☁️", "👤")
+
+# Windows sometimes mangles a Unix file:/// path by inserting a drive-letter
+# colon after the first character of the first path segment ("home" ->
+# "h:ome"). A real drive letter is always followed by "/" (file:///C:/...),
+# so a letter+colon NOT followed by "/" is this glitch, not a real path.
+WINDOWS_DRIVE_GLITCH_RE = re.compile(r"^(file:///)([A-Za-z]):(?!/)")
+
+
+def normalize_file_url(url):
+    return WINDOWS_DRIVE_GLITCH_RE.sub(r"\1\2", url)
+
 # Excludes the literal root and, via the recursive CTE, everything under the
-# hidden "tags" folder -- Firefox tags have no Chromium equivalent and would
-# otherwise show up as bogus folders/duplicate links.
+# hidden "tags" folder (Firefox tags have no Chromium equivalent) and under
+# EXCLUDED_FOLDER_TITLES.
 FIREFOX_QUERY = """
-    WITH RECURSIVE tag_tree(id) AS (
-        SELECT id FROM moz_bookmarks WHERE guid = 'tags________'
+    WITH RECURSIVE excluded_tree(id) AS (
+        SELECT id FROM moz_bookmarks WHERE guid = 'tags________' OR (type = 2 AND title IN (?, ?))
         UNION ALL
-        SELECT b.id FROM moz_bookmarks b JOIN tag_tree t ON b.parent = t.id
+        SELECT b.id FROM moz_bookmarks b JOIN excluded_tree t ON b.parent = t.id
     )
     SELECT b.id, b.parent, b.type, b.title, b.guid, p.url
     FROM moz_bookmarks b
     LEFT JOIN moz_places p ON b.fk = p.id
     WHERE b.guid != 'root________'
-      AND b.id NOT IN (SELECT id FROM tag_tree)
+      AND b.id NOT IN (SELECT id FROM excluded_tree)
 """
 
 
@@ -105,12 +123,14 @@ def find_firefox_places_db():
 
 def walk_chromium(node, prefix, folders, links):
     if node.get("type") == "folder":
+        if node.get("name") in EXCLUDED_FOLDER_TITLES:
+            return  # hand-curated mirror folder, excluded entirely
         full = f"{prefix}/{node['name']}" if prefix else node["name"]
         folders.append(full)
         for child in node.get("children", []):
             walk_chromium(child, full, folders, links)
     elif node.get("type") == "url":
-        links.append((node["url"], node.get("name", "")))
+        links.append((normalize_file_url(node["url"]), node.get("name", ""), prefix))
 
 
 def get_chromium_tree(bookmarks_path):
@@ -142,7 +162,7 @@ def firefox_path(row, by_id):
 
 
 def fetch_firefox_rows(con):
-    return con.execute(FIREFOX_QUERY).fetchall()
+    return con.execute(FIREFOX_QUERY, EXCLUDED_FOLDER_TITLES).fetchall()
 
 
 def get_firefox_tree(places_db):
@@ -156,7 +176,10 @@ def get_firefox_tree(places_db):
     # Same rule as Chromium: the root folders themselves (Bookmarks Menu,
     # Toolbar, ...) aren't counted, only what's nested under them.
     folders = [firefox_path(r, by_id) for r in rows if r[2] == 2 and r[4] not in FIREFOX_ROOT_NAMES]
-    links = [(r[5], r[3] or "") for r in rows if r[2] == 1 and r[5]]
+    links = [
+        (normalize_file_url(r[5]), r[3] or "", firefox_path(by_id[r[1]], by_id) if r[1] in by_id else "")
+        for r in rows if r[2] == 1 and r[5]
+    ]
     return folders, links
 
 
@@ -168,11 +191,26 @@ def diff(a, b):
 
 
 def url_counts(links):
-    return Counter(u for u, _ in links)
+    return Counter(u for u, _, _ in links)
+
+
+# A link is a "quick access" copy -- not a real classification -- if it sits
+# loose at a root's top level (folder == "") or under a "://" folder (used
+# for scheme-named shortcuts like about:/chrome:/moz-extension:). These are
+# excluded when checking for duplicates, but still counted as real bookmarks.
+def is_dupe_exempt(folder):
+    return folder == "" or folder.startswith("://")
+
+
+def dupe_url_counts(links):
+    return Counter(u for u, _, folder in links if not is_dupe_exempt(folder))
 
 
 def stats(label, path, folders, links):
-    urls = [u for u, _ in links]
+    urls = [u for u, _, _ in links]
+    # Quick-access copies (loose or under a "://" folder) don't count as
+    # duplicates -- only extra copies among "real" classified placements do.
+    dupe_urls = [u for u, _, folder in links if not is_dupe_exempt(folder)]
     stat = Path(path).stat()
     return {
         "label": label,
@@ -181,7 +219,7 @@ def stats(label, path, folders, links):
         "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
         "bookmarks": len(urls),
         "folders": len(folders),
-        "duplicates": len(urls) - len(set(urls)),
+        "duplicates": len(dupe_urls) - len(set(dupe_urls)),
     }
 
 
@@ -210,22 +248,22 @@ def build_report(chromium_stats, chromium_folders, chromium_links, firefox_stats
         ("Duplicate URLs (within browser)", chromium_stats["duplicates"], firefox_stats["duplicates"]),
     ]
 
-    chromium_urls = {u for u, _ in chromium_links}
-    firefox_urls = {u for u, _ in firefox_links}
+    chromium_urls = {u for u, _, _ in chromium_links}
+    firefox_urls = {u for u, _, _ in firefox_links}
     overlap = len(chromium_urls & firefox_urls)
 
     folder_rows = [(f, "Chromium") for f in diff(chromium_folders, firefox_folders)]
     folder_rows += [(f, "Firefox") for f in diff(firefox_folders, chromium_folders)]
 
     link_rows = sorted(
-        [(u, t, "Chromium") for u, t in chromium_links if u not in firefox_urls]
-        + [(u, t, "Firefox") for u, t in firefox_links if u not in chromium_urls]
+        [(u, t, "Chromium") for u, t, _ in chromium_links if u not in firefox_urls]
+        + [(u, t, "Firefox") for u, t, _ in firefox_links if u not in chromium_urls]
     )
 
-    chromium_counts = url_counts(chromium_links)
-    firefox_counts = url_counts(firefox_links)
-    titles = dict(firefox_links)
-    titles.update(chromium_links)  # Chromium's title wins if both sides have one
+    chromium_counts = dupe_url_counts(chromium_links)
+    firefox_counts = dupe_url_counts(firefox_links)
+    titles = {u: t for u, t, _ in firefox_links}
+    titles.update({u: t for u, t, _ in chromium_links})  # Chromium's title wins if both sides have one
     dupe_rows = [
         (u, titles.get(u, ""), chromium_counts.get(u, 0), firefox_counts.get(u, 0))
         for u in sorted(set(chromium_counts) | set(firefox_counts))
@@ -271,6 +309,12 @@ def self_test():
                     {"type": "folder", "name": "Work", "children": [
                         {"type": "url", "name": "Ex2", "url": "https://ex2.example"},
                     ]},
+                    {"type": "folder", "name": "☁️", "children": [
+                        {"type": "url", "name": "Ex dup", "url": "https://ex.example"},
+                    ]},
+                    {"type": "folder", "name": "👤", "children": [
+                        {"type": "url", "name": "Ex dup 2", "url": "https://ex.example"},
+                    ]},
                 ],
             }
         }
@@ -282,7 +326,9 @@ def self_test():
     assert "Bookmark Bar" not in folders
     assert "Bookmark Bar/Work" not in folders
     assert "Work" in folders
-    assert len(links) == 2, links
+    assert "☁️" not in folders
+    assert "👤" not in folders
+    assert len(links) == 2, links  # the ☁️/👤 duplicates of Ex are excluded entirely
 
     rows = [
         (2, 1, 2, None, "menu________", None),
@@ -293,14 +339,16 @@ def self_test():
     assert firefox_path(rows[1], by_id) == "Work"
     ff_folders = [firefox_path(r, by_id) for r in rows if r[2] == 2 and r[4] not in FIREFOX_ROOT_NAMES]
     assert ff_folders == ["Work"], ff_folders
-    ff_links = [(r[5], r[3] or "") for r in rows if r[2] == 1 and r[5]]
-    assert ff_links == [("https://ex.example", "Ex")]
+    ff_links = [
+        (r[5], r[3] or "", firefox_path(by_id[r[1]], by_id)) for r in rows if r[2] == 1 and r[5]
+    ]
+    assert ff_links == [("https://ex.example", "Ex", "Work")]
 
     # Same relative folder name, different root -- must now match and cancel out.
     assert diff(["Work"], ["Work"]) == []
     assert diff(["a", "a", "b"], ["b"]) == ["a"]
 
-    # Exercise the real recursive-CTE tag exclusion against an in-memory db.
+    # Exercise the real recursive-CTE tag/☁️/👤 exclusion against an in-memory db.
     con = sqlite3.connect(":memory:")
     con.executescript(
         """
@@ -314,7 +362,11 @@ def self_test():
             (4, 3, 1, 'Ex', 'ex1', 100),
             (5, 1, 2, NULL, 'tags________', NULL),
             (6, 5, 2, 'mytag', 'tag1', NULL),
-            (7, 6, 1, 'Tagged', 'tag2', 100);
+            (7, 6, 1, 'Tagged', 'tag2', 100),
+            (8, 2, 2, '☁️', 'cloud1', NULL),
+            (9, 8, 1, 'Ex dup', 'exdup1', 100),
+            (10, 2, 2, '👤', 'person1', NULL),
+            (11, 10, 1, 'Ex dup 2', 'exdup2', 100);
         """
     )
     tag_rows = fetch_firefox_rows(con)
@@ -328,7 +380,7 @@ def self_test():
     assert fake_stats["folders"] == 1
     assert fake_stats["duplicates"] == 0
 
-    report = build_report(fake_stats, ["A"], [("https://x", "X")], fake_stats, ["B"], [("https://x", "X")])
+    report = build_report(fake_stats, ["A"], [("https://x", "X", "Cat")], fake_stats, ["B"], [("https://x", "X", "Cat")])
     assert "Total bookmarks" in report
     assert "| A | Chromium |" in report
     assert "| B | Firefox |" in report
@@ -336,23 +388,50 @@ def self_test():
 
     # Identical inputs on both sides -- diff tables should read as empty,
     # not render as a header with zero rows underneath.
-    same_report = build_report(fake_stats, ["A"], [("https://x", "X")], fake_stats, ["A"], [("https://x", "X")])
+    same_report = build_report(
+        fake_stats, ["A"], [("https://x", "X", "Cat")], fake_stats, ["A"], [("https://x", "X", "Cat")]
+    )
     assert "No folder differences found." in same_report
     assert "No link differences found." in same_report
     assert "No duplicate URLs found." in same_report
 
-    assert url_counts([("https://a", "A"), ("https://a", "A2"), ("https://b", "B")]) == Counter(
-        {"https://a": 2, "https://b": 1}
-    )
-    dupe_links = [("https://a", "A"), ("https://a", "A")]  # duplicated in Chromium only
-    dupe_report = build_report(fake_stats, [], dupe_links, fake_stats, [], [("https://a", "A")])
+    assert url_counts(
+        [("https://a", "A", "Cat"), ("https://a", "A2", "Cat2"), ("https://b", "B", "Cat")]
+    ) == Counter({"https://a": 2, "https://b": 1})
+
+    dupe_links = [("https://a", "A", "Cat"), ("https://a", "A", "Cat2")]  # 2 real placements -- duplicated in Chromium only
+    dupe_report = build_report(fake_stats, [], dupe_links, fake_stats, [], [("https://a", "A", "Cat")])
     assert "| https://a | A | 2 | 1 |" in dupe_report
+
+    # Loose/"unsorted" and "://" copies are quick-access shortcuts, not real
+    # duplicates -- one real placement plus any number of those shouldn't count.
+    assert is_dupe_exempt("")
+    assert is_dupe_exempt("://")
+    assert is_dupe_exempt(":///moz://")
+    assert not is_dupe_exempt("Categories/Tools")
+    quick_access_links = [("https://c", "C", "Cat"), ("https://c", "C", ""), ("https://c", "C", "://")]
+    assert dupe_url_counts(quick_access_links) == Counter({"https://c": 1})
+    no_dupe_report = build_report(fake_stats, [], quick_access_links, fake_stats, [], [])
+    assert "No duplicate URLs found." in no_dupe_report
 
     # A title containing "|" or a newline must not corrupt the table structure.
     assert escape_cell("Foo | Bar") == "Foo \\| Bar"
     assert escape_cell("Foo\nBar") == "Foo Bar"
-    pipe_report = build_report(fake_stats, [], [("https://p", "Foo | Bar")], fake_stats, [], [])
+    pipe_report = build_report(fake_stats, [], [("https://p", "Foo | Bar", "Cat")], fake_stats, [], [])
     assert "| https://p | Foo \\| Bar | Chromium |" in pipe_report
+
+    # Windows sometimes mangles file:/// paths by inserting a drive-letter
+    # colon into the first segment -- normalize_file_url() (applied by both
+    # parsers at read time) undoes it so it matches the real (Chromium) copy
+    # instead of showing up as a fake diff.
+    assert normalize_file_url("file:///h:ome/d7/.bash_history") == "file:///home/d7/.bash_history"
+    assert normalize_file_url("file:///C:/Users/x") == "file:///C:/Users/x"  # real drive letter, untouched
+    assert normalize_file_url("https://example.com/") == "https://example.com/"
+    glitch_report = build_report(
+        fake_stats, [], [(normalize_file_url("file:///home/d7/.bash_history"), "history", "Cat")],
+        fake_stats, [], [(normalize_file_url("file:///h:ome/d7/.bash_history"), "history", "Cat")],
+    )
+    assert "No link differences found." in glitch_report
 
     print("SelfTest OK")
 
