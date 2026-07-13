@@ -35,14 +35,27 @@ FIREFOX_ROOT_NAMES = {
 EXCLUDED_FOLDER_TITLES = ("☁️", "👤")
 
 # Windows sometimes mangles a Unix file:/// path by inserting a drive-letter
-# colon after the first character of the first path segment ("home" ->
-# "h:ome"). A real drive letter is always followed by "/" (file:///C:/...),
-# so a letter+colon NOT followed by "/" is this glitch, not a real path.
-WINDOWS_DRIVE_GLITCH_RE = re.compile(r"^(file:///)([A-Za-z]):(?!/)")
+# colon into the first path segment ("home" -> "h:ome" or "H:/ome" -- the
+# slash after the colon isn't reliable, it shows up either way). Instead of
+# guessing from colon/slash placement, check whether removing the colon
+# reconstructs a well-known Unix top-level directory -- a real Windows drive
+# essentially never coincidentally does that.
+UNIX_ROOT_DIRS = {
+    "home", "usr", "etc", "var", "tmp", "opt", "mnt", "srv", "media",
+    "run", "root", "bin", "sbin", "lib", "proc", "sys", "dev",
+}
+WINDOWS_DRIVE_GLITCH_RE = re.compile(r"^(file:///)([A-Za-z]):/?([a-zA-Z]+)(/.*)?$")
 
 
 def normalize_file_url(url):
-    return WINDOWS_DRIVE_GLITCH_RE.sub(r"\1\2", url)
+    match = WINDOWS_DRIVE_GLITCH_RE.match(url)
+    if not match:
+        return url
+    prefix, letter, rest, tail = match.groups()
+    reconstructed = (letter + rest).lower()
+    if reconstructed not in UNIX_ROOT_DIRS:
+        return url
+    return f"{prefix}{reconstructed}{tail or ''}"
 
 # Excludes the literal root and, via the recursive CTE, everything under the
 # hidden "tags" folder (Firefox tags have no Chromium equivalent) and under
@@ -421,15 +434,17 @@ def self_test():
     assert "| https://p | Foo \\| Bar | Chromium |" in pipe_report
 
     # Windows sometimes mangles file:/// paths by inserting a drive-letter
-    # colon into the first segment -- normalize_file_url() (applied by both
-    # parsers at read time) undoes it so it matches the real (Chromium) copy
-    # instead of showing up as a fake diff.
+    # colon into the first segment -- with or without a slash right after it
+    # -- normalize_file_url() (applied by both parsers at read time) undoes
+    # it so it matches the real (Chromium) copy instead of showing up as a
+    # fake diff.
     assert normalize_file_url("file:///h:ome/d7/.bash_history") == "file:///home/d7/.bash_history"
+    assert normalize_file_url("file:///H:/ome/d7/.bash_history") == "file:///home/d7/.bash_history"
     assert normalize_file_url("file:///C:/Users/x") == "file:///C:/Users/x"  # real drive letter, untouched
     assert normalize_file_url("https://example.com/") == "https://example.com/"
     glitch_report = build_report(
         fake_stats, [], [(normalize_file_url("file:///home/d7/.bash_history"), "history", "Cat")],
-        fake_stats, [], [(normalize_file_url("file:///h:ome/d7/.bash_history"), "history", "Cat")],
+        fake_stats, [], [(normalize_file_url("file:///H:/ome/d7/.bash_history"), "history", "Cat")],
     )
     assert "No link differences found." in glitch_report
 

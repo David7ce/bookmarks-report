@@ -20,7 +20,7 @@ Requires Python 3 (stdlib only — `json`, `sqlite3`, `configparser`).
 - Excludes Firefox's hidden "tags" folder — no Chromium equivalent.
 - Excludes the "☁️" and "👤" folders entirely (both browsers) — hand-curated cross-references of bookmarks that already live elsewhere, so counting them would just report false duplicates.
 - For duplicate detection only, ignores "quick access" copies: a link sitting loose at a root's top level (not in any subfolder) or under a "://" folder (scheme-named shortcuts like `about:`/`chrome:`/`moz-extension:`). These still count as real bookmarks everywhere else in the report — only the duplicate check skips them, since a real classified copy plus a quick-access copy isn't a true duplicate.
-- Normalizes a Windows `file:///` quirk where the first path segment gets a spurious drive-letter colon inserted (`file:///home/...` saved as `file:///h:ome/...`) — a real drive letter is always followed by `/`, so this is detected and undone before comparing, instead of showing up as a fake link difference.
+- Normalizes a Windows `file:///` quirk where the first path segment gets a spurious drive-letter colon inserted (`file:///home/...` saved as `file:///h:ome/...` or `file:///H:/ome/...` — the slash after the colon isn't reliable, it shows up either way). Detected by checking whether removing the colon reconstructs a well-known Unix top-level directory (`home`, `usr`, `etc`, `tmp`, ...) — a real Windows drive essentially never coincidentally does that — and undone before comparing, instead of showing up as a fake link difference.
 - Report sections: summary stats, folders only in one browser, links only in one browser, and duplicate URLs (bookmarked more than once) with per-browser counts.
 
 ## Notes
