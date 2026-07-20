@@ -57,12 +57,25 @@ def normalize_file_url(url):
         return url
     return f"{prefix}{reconstructed}{tail or ''}"
 
+
+def normalize_url(url):
+    # Applied only for comparison (dedup/diffing), never written back to
+    # either browser -- a trailing slash on anything but a bare scheme
+    # ("http://") is the same bookmark for matching purposes.
+    url = normalize_file_url(url)
+    if url.endswith("/") and url.count("/") > 2:
+        url = url[:-1]
+    return url
+
 # Excludes the literal root and, via the recursive CTE, everything under the
 # hidden "tags" folder (Firefox tags have no Chromium equivalent) and under
-# EXCLUDED_FOLDER_TITLES.
+# any folder whose title *contains* one of EXCLUDED_FOLDER_TITLES (not just
+# an exact match, so e.g. "☁️ Cloud" is still caught).
 FIREFOX_QUERY = """
     WITH RECURSIVE excluded_tree(id) AS (
-        SELECT id FROM moz_bookmarks WHERE guid = 'tags________' OR (type = 2 AND title IN (?, ?))
+        SELECT id FROM moz_bookmarks
+        WHERE guid = 'tags________'
+           OR (type = 2 AND (title LIKE '%' || ? || '%' OR title LIKE '%' || ? || '%'))
         UNION ALL
         SELECT b.id FROM moz_bookmarks b JOIN excluded_tree t ON b.parent = t.id
     )
@@ -136,14 +149,14 @@ def find_firefox_places_db():
 
 def walk_chromium(node, prefix, folders, links):
     if node.get("type") == "folder":
-        if node.get("name") in EXCLUDED_FOLDER_TITLES:
+        if any(marker in node.get("name", "") for marker in EXCLUDED_FOLDER_TITLES):
             return  # hand-curated mirror folder, excluded entirely
         full = f"{prefix}/{node['name']}" if prefix else node["name"]
         folders.append(full)
         for child in node.get("children", []):
             walk_chromium(child, full, folders, links)
     elif node.get("type") == "url":
-        links.append((normalize_file_url(node["url"]), node.get("name", ""), prefix))
+        links.append((normalize_url(node["url"]), node.get("name", ""), prefix))
 
 
 def get_chromium_tree(bookmarks_path):
@@ -190,7 +203,7 @@ def get_firefox_tree(places_db):
     # Toolbar, ...) aren't counted, only what's nested under them.
     folders = [firefox_path(r, by_id) for r in rows if r[2] == 2 and r[4] not in FIREFOX_ROOT_NAMES]
     links = [
-        (normalize_file_url(r[5]), r[3] or "", firefox_path(by_id[r[1]], by_id) if r[1] in by_id else "")
+        (normalize_url(r[5]), r[3] or "", firefox_path(by_id[r[1]], by_id) if r[1] in by_id else "")
         for r in rows if r[2] == 1 and r[5]
     ]
     return folders, links
@@ -322,10 +335,10 @@ def self_test():
                     {"type": "folder", "name": "Work", "children": [
                         {"type": "url", "name": "Ex2", "url": "https://ex2.example"},
                     ]},
-                    {"type": "folder", "name": "☁️", "children": [
+                    {"type": "folder", "name": "☁️ Cloud", "children": [
                         {"type": "url", "name": "Ex dup", "url": "https://ex.example"},
                     ]},
-                    {"type": "folder", "name": "👤", "children": [
+                    {"type": "folder", "name": "👤 Personal", "children": [
                         {"type": "url", "name": "Ex dup 2", "url": "https://ex.example"},
                     ]},
                 ],
@@ -339,8 +352,8 @@ def self_test():
     assert "Bookmark Bar" not in folders
     assert "Bookmark Bar/Work" not in folders
     assert "Work" in folders
-    assert "☁️" not in folders
-    assert "👤" not in folders
+    assert "☁️ Cloud" not in folders  # substring match, not just an exact "☁️" title
+    assert "👤 Personal" not in folders
     assert len(links) == 2, links  # the ☁️/👤 duplicates of Ex are excluded entirely
 
     rows = [
@@ -376,9 +389,9 @@ def self_test():
             (5, 1, 2, NULL, 'tags________', NULL),
             (6, 5, 2, 'mytag', 'tag1', NULL),
             (7, 6, 1, 'Tagged', 'tag2', 100),
-            (8, 2, 2, '☁️', 'cloud1', NULL),
+            (8, 2, 2, '☁️ Cloud', 'cloud1', NULL),
             (9, 8, 1, 'Ex dup', 'exdup1', 100),
-            (10, 2, 2, '👤', 'person1', NULL),
+            (10, 2, 2, '👤 Personal', 'person1', NULL),
             (11, 10, 1, 'Ex dup 2', 'exdup2', 100);
         """
     )
@@ -447,6 +460,17 @@ def self_test():
         fake_stats, [], [(normalize_file_url("file:///H:/ome/d7/.bash_history"), "history", "Cat")],
     )
     assert "No link differences found." in glitch_report
+
+    # A trailing slash shouldn't make the same bookmark look like a diff.
+    assert normalize_url("https://example.com/path/") == "https://example.com/path"
+    assert normalize_url("https://example.com/") == "https://example.com"
+    assert normalize_url("about:blank") == "about:blank"  # no slashes at all, untouched
+    assert normalize_url("file:///h:ome/d7/.bash_history") == "file:///home/d7/.bash_history"
+    slash_report = build_report(
+        fake_stats, [], [(normalize_url("https://example.com/path"), "p", "Cat")],
+        fake_stats, [], [(normalize_url("https://example.com/path/"), "p", "Cat")],
+    )
+    assert "No link differences found." in slash_report
 
     print("SelfTest OK")
 

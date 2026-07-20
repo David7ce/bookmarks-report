@@ -36,6 +36,7 @@ from bookmark_report import (
     find_firefox_places_db,
     get_chromium_tree,
     get_firefox_tree,
+    is_dupe_exempt,
     render_table,
 )
 
@@ -109,12 +110,15 @@ def domain_of(url):
 
 
 def descriptive_folder_name(domain):
+    if not domain:
+        return "Unsorted"
+    host = domain.split(":")[0]  # drop the port, if any
+    labels = host.split(".")
+    if all(label.isdigit() for label in labels):
+        return host  # IPv4 address -- the address itself is the clearest name
     # Use every label except the TLD, not just the first one, so context
     # like "office" in "outlook.office.com" isn't dropped -- more
     # descriptive than a bare first-label guess.
-    if not domain:
-        return "Unsorted"
-    labels = domain.split(".")
     parts = labels[:-1] if len(labels) > 1 else labels
     return " ".join(parts).replace("-", " ").replace("_", " ").title()
 
@@ -127,8 +131,8 @@ def extract_taxonomy(by_id):
         if row[TYPE] != 1 or not row[URL]:
             continue
         folder = folder_path(by_id[row[PARENT]], by_id)
-        if not folder:
-            continue  # loose link, not a real classification
+        if is_dupe_exempt(folder):
+            continue  # loose, or a "://" quick-access/scheme folder -- not a real classification
         if any(marker in folder for marker in MANUAL_ONLY_MARKERS):
             continue  # hand-curated folder, never an auto-classification target
         domain = domain_of(row[URL])
@@ -337,6 +341,11 @@ def self_test():
         # Never-classified, loose directly in the Toolbar -- new folder must
         # land in the Toolbar (its origin), not hardcoded to Unfiled.
         (15, 3, 1, "Novel", "novel1", 4, 8000, "https://totally-different.example/z"),
+        # A "://" scheme/quick-access folder -- never a taxonomy match target,
+        # even though it's a real, non-loose folder.
+        (16, 3, 2, "://Local Network", "scheme1", 5, 8500, None),
+        (17, 16, 1, "Router", "router1", 0, 9000, "http://192.168.1.1/"),
+        (18, 3, 1, "Router2", "router2", 6, 9500, "http://192.168.1.1/status"),
     ]
     by_id = {r[ID]: r for r in rows}
 
@@ -346,6 +355,7 @@ def self_test():
     taxonomy = extract_taxonomy(by_id)
     assert taxonomy == {"github.com": "Dev"}, taxonomy
     assert "drive.google.com" not in taxonomy  # hand-curated "Cloud" folder never a match target
+    assert "192.168.1.1" not in taxonomy  # "://" scheme folder never a match target either
 
     plan = plan_classification(by_id, taxonomy)
     by_row_id = {p["row_id"]: p for p in plan}
@@ -355,10 +365,16 @@ def self_test():
     assert by_row_id[13]["action"] == "move" and by_row_id[13]["target"] == "Dev"  # loose in Toolbar, still classified
     assert 14 not in by_row_id  # quick-access pin of an already-filed URL -- left alone
     assert by_row_id[15]["action"] == "new_folder" and by_row_id[15]["target"] == "Totally Different"
+    # Loose duplicate of the IP already sitting in the "://" scheme folder --
+    # must get its own new folder, not be routed into the scheme folder.
+    assert by_row_id[18]["action"] == "new_folder" and by_row_id[18]["target"] == "192.168.1.1"
 
     assert descriptive_folder_name("outlook.office.com") == "Outlook Office"  # keeps context, not just first label
     assert descriptive_folder_name("mega.nz") == "Mega"
     assert descriptive_folder_name("") == "Unsorted"
+    assert descriptive_folder_name("127.0.0.1:8080") == "127.0.0.1"  # IP+port -- not split into nonsense
+    assert descriptive_folder_name("192.168.1.1") == "192.168.1.1"
+    assert descriptive_folder_name("localhost:8080") == "Localhost"  # port dropped, no stray colon
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
