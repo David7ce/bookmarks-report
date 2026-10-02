@@ -478,6 +478,12 @@ def self_test():
 # ---- entry point -------------------------------------------------------
 
 def main():
+    # Windows consoles default to a legacy code page and the help text has emoji:
+    # print UTF-8 (replacing what the console cannot show) instead of crashing.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-o", "--out", default="bookmark-report.md", help="output markdown path")
     parser.add_argument("--self-test", action="store_true", help="run built-in checks on synthetic data and exit")
