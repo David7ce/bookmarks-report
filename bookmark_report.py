@@ -34,6 +34,28 @@ FIREFOX_ROOT_NAMES = {
 # excluded entirely so they don't show up as bogus duplicates.
 EXCLUDED_FOLDER_TITLES = ("☁️", "👤")
 
+# A copy inside ☁️/👤 still means "this browser has that bookmark". Excluding
+# those folders from the totals is right; excluding them from the *presence*
+# check is not, or a bookmark filed under Categories in one browser and
+# mirrored under 👤 in the other is reported as missing every single run.
+#
+# Schemes a browser can navigate to. `place:` (Firefox smart bookmarks),
+# `about:`, `chrome:` and `moz-extension:` are not bookmarks anyone can open
+# from a bookmark list, so they never belong in a "only in one browser" row.
+NON_NAVIGABLE_PREFIXES = (
+    "place:",
+    "about:",
+    "chrome:",
+    "moz-extension:",
+    "javascript:",
+    "data:",
+)
+
+
+def is_navigable(url):
+    return not url.startswith(NON_NAVIGABLE_PREFIXES)
+
+
 # Windows sometimes mangles a Unix file:/// path by inserting a drive-letter
 # colon into the first path segment ("home" -> "h:ome" or "H:/ome" -- the
 # slash after the colon isn't reliable, it shows up either way). Instead of
@@ -67,23 +89,30 @@ def normalize_url(url):
         url = url[:-1]
     return url
 
-# Excludes the literal root and, via the recursive CTE, everything under the
-# hidden "tags" folder (Firefox tags have no Chromium equivalent) and under
-# any folder whose title *contains* one of EXCLUDED_FOLDER_TITLES (not just
-# an exact match, so e.g. "☁️ Cloud" is still caught).
+# Excludes the literal root and everything under the hidden "tags" folder
+# (Firefox tags have no Chromium equivalent). Folders whose title *contains*
+# one of EXCLUDED_FOLDER_TITLES ("☁️ Cloud", "👤 Personal") are flagged
+# `hidden` instead of dropped: they don't count as folders or bookmarks, but
+# their URLs still prove the browser has that bookmark.
 FIREFOX_QUERY = """
-    WITH RECURSIVE excluded_tree(id) AS (
-        SELECT id FROM moz_bookmarks
-        WHERE guid = 'tags________'
-           OR (type = 2 AND (title LIKE '%' || ? || '%' OR title LIKE '%' || ? || '%'))
+    WITH RECURSIVE
+      tag_tree(id) AS (
+        SELECT id FROM moz_bookmarks WHERE guid = 'tags________'
         UNION ALL
-        SELECT b.id FROM moz_bookmarks b JOIN excluded_tree t ON b.parent = t.id
-    )
-    SELECT b.id, b.parent, b.type, b.title, b.guid, p.url
+        SELECT b.id FROM moz_bookmarks b JOIN tag_tree t ON b.parent = t.id
+      ),
+      hidden_tree(id) AS (
+        SELECT id FROM moz_bookmarks
+        WHERE type = 2 AND (title LIKE '%' || ? || '%' OR title LIKE '%' || ? || '%')
+        UNION ALL
+        SELECT b.id FROM moz_bookmarks b JOIN hidden_tree h ON b.parent = h.id
+      )
+    SELECT b.id, b.parent, b.type, b.title, b.guid, p.url,
+           CASE WHEN b.id IN (SELECT id FROM hidden_tree) THEN 1 ELSE 0 END AS hidden
     FROM moz_bookmarks b
     LEFT JOIN moz_places p ON b.fk = p.id
     WHERE b.guid != 'root________'
-      AND b.id NOT IN (SELECT id FROM excluded_tree)
+      AND b.id NOT IN (SELECT id FROM tag_tree)
 """
 
 
@@ -147,16 +176,21 @@ def find_firefox_places_db():
 
 # ---- parsing -----------------------------------------------------------
 
-def walk_chromium(node, prefix, folders, links):
+def walk_chromium(node, prefix, folders, links, presence, hidden=False):
     if node.get("type") == "folder":
-        if any(marker in node.get("name", "") for marker in EXCLUDED_FOLDER_TITLES):
-            return  # hand-curated mirror folder, excluded entirely
+        is_hidden = hidden or any(
+            marker in node.get("name", "") for marker in EXCLUDED_FOLDER_TITLES
+        )
         full = f"{prefix}/{node['name']}" if prefix else node["name"]
-        folders.append(full)
+        if not is_hidden:
+            folders.append(full)  # hand-curated mirror folders are not folders
         for child in node.get("children", []):
-            walk_chromium(child, full, folders, links)
+            walk_chromium(child, full, folders, links, presence, is_hidden)
     elif node.get("type") == "url":
-        links.append((normalize_url(node["url"]), node.get("name", ""), prefix))
+        url = normalize_url(node["url"])
+        presence.add(url)  # present in this browser, wherever it is filed
+        if not hidden:
+            links.append((url, node.get("name", ""), prefix))
 
 
 def get_chromium_tree(bookmarks_path):
@@ -166,17 +200,17 @@ def get_chromium_tree(bookmarks_path):
     # different root names (Bookmark Bar vs Bookmarks Toolbar) would never
     # match across browsers.
     data = json.loads(Path(bookmarks_path).read_text(encoding="utf-8"))
-    folders, links = [], []
+    folders, links, presence = [], [], set()
     for root in data.get("roots", {}).values():
         if not root.get("name"):
             continue
         for child in root.get("children", []):
-            walk_chromium(child, "", folders, links)
-    return folders, links
+            walk_chromium(child, "", folders, links, presence)
+    return folders, links, presence
 
 
 def firefox_path(row, by_id):
-    _id, parent, _type, title, guid, _url = row
+    _id, parent, _type, title, guid, _url = row[:6]
     if guid in FIREFOX_ROOT_NAMES:
         return ""  # root container itself, excluded from the path
     name = title or "(untitled)"
@@ -199,14 +233,18 @@ def get_firefox_tree(places_db):
         con.close()
 
     by_id = {r[0]: r for r in rows}
+    visible = [r for r in rows if not r[6]]
     # Same rule as Chromium: the root folders themselves (Bookmarks Menu,
     # Toolbar, ...) aren't counted, only what's nested under them.
-    folders = [firefox_path(r, by_id) for r in rows if r[2] == 2 and r[4] not in FIREFOX_ROOT_NAMES]
+    folders = [firefox_path(r, by_id) for r in visible if r[2] == 2 and r[4] not in FIREFOX_ROOT_NAMES]
     links = [
         (normalize_url(r[5]), r[3] or "", firefox_path(by_id[r[1]], by_id) if r[1] in by_id else "")
-        for r in rows if r[2] == 1 and r[5]
+        for r in visible if r[2] == 1 and r[5]
     ]
-    return folders, links
+    # Hidden folders (☁️/👤) are mirrors: they don't count, but they do prove
+    # the browser has the bookmark, which is what the presence check needs.
+    presence = {normalize_url(r[5]) for r in rows if r[2] == 1 and r[5]}
+    return folders, links, presence
 
 
 # ---- comparison ----------------------------------------------------------
@@ -263,7 +301,16 @@ def render_table(headers, rows):
     return "\n".join(lines)
 
 
-def build_report(chromium_stats, chromium_folders, chromium_links, firefox_stats, firefox_folders, firefox_links):
+def build_report(
+    chromium_stats,
+    chromium_folders,
+    chromium_links,
+    firefox_stats,
+    firefox_folders,
+    firefox_links,
+    chromium_presence=None,
+    firefox_presence=None,
+):
     summary_rows = [
         ("Browser / profile", chromium_stats["label"], firefox_stats["label"]),
         ("Bookmarks file", f"`{chromium_stats['path']}`", f"`{firefox_stats['path']}`"),
@@ -274,6 +321,12 @@ def build_report(chromium_stats, chromium_folders, chromium_links, firefox_stats
         ("Duplicate URLs (within browser)", chromium_stats["duplicates"], firefox_stats["duplicates"]),
     ]
 
+    # Presence, not the counted links, decides "does this browser have it?": a
+    # copy filed under ☁️/👤 still counts as present, so it is not reported as
+    # missing. Overlap stays on the counted sets so it remains comparable to
+    # the totals above (presence also contains the mirror copies).
+    chromium_present = set(chromium_presence) if chromium_presence is not None else {u for u, _, _ in chromium_links}
+    firefox_present = set(firefox_presence) if firefox_presence is not None else {u for u, _, _ in firefox_links}
     chromium_urls = {u for u, _, _ in chromium_links}
     firefox_urls = {u for u, _, _ in firefox_links}
     overlap = len(chromium_urls & firefox_urls)
@@ -281,9 +334,12 @@ def build_report(chromium_stats, chromium_folders, chromium_links, firefox_stats
     folder_rows = [(f, "Chromium") for f in diff(chromium_folders, firefox_folders)]
     folder_rows += [(f, "Firefox") for f in diff(firefox_folders, chromium_folders)]
 
+    # Only real navigable URLs: a Firefox smart bookmark (`place:...`) is not
+    # something anyone opens from a bookmark list, and reporting it as a
+    # missing link every run is noise.
     link_rows = sorted(
-        [(u, t, "Chromium") for u, t, _ in chromium_links if u not in firefox_urls]
-        + [(u, t, "Firefox") for u, t, _ in firefox_links if u not in chromium_urls]
+        [(u, t, "Chromium") for u, t, _ in chromium_links if u not in firefox_present and is_navigable(u)]
+        + [(u, t, "Firefox") for u, t, _ in firefox_links if u not in chromium_present and is_navigable(u)]
     )
 
     chromium_counts = dupe_url_counts(chromium_links)
@@ -345,16 +401,17 @@ def self_test():
             }
         }
     }
-    folders, links = [], []
+    folders, links, presence = [], [], set()
     for root in tree["roots"].values():
         for child in root["children"]:
-            walk_chromium(child, "", folders, links)
+            walk_chromium(child, "", folders, links, presence)
     assert "Bookmark Bar" not in folders
     assert "Bookmark Bar/Work" not in folders
     assert "Work" in folders
     assert "☁️ Cloud" not in folders  # substring match, not just an exact "☁️" title
     assert "👤 Personal" not in folders
     assert len(links) == 2, links  # the ☁️/👤 duplicates of Ex are excluded entirely
+    assert presence == {"https://ex.example", "https://ex2.example"}, presence
 
     rows = [
         (2, 1, 2, None, "menu________", None),
@@ -397,8 +454,13 @@ def self_test():
     )
     tag_rows = fetch_firefox_rows(con)
     con.close()
-    seen_guids = {r[4] for r in tag_rows}
-    assert seen_guids == {"menu________", "work1", "ex1"}, seen_guids
+    # The tags tree is still dropped entirely; ☁️/👤 come back flagged instead
+    # of filtered, so their URLs can still prove presence.
+    visible_guids = {r[4] for r in tag_rows if not r[6]}
+    assert visible_guids == {"menu________", "work1", "ex1"}, visible_guids
+    hidden_guids = {r[4] for r in tag_rows if r[6]}
+    assert hidden_guids == {"cloud1", "exdup1", "person1", "exdup2"}, hidden_guids
+    assert not ({"tag1", "tag2"} & {r[4] for r in tag_rows})
 
     # Summary stats derived from folders/links, not re-queried.
     fake_stats = stats("Test (p)", __file__, ff_folders, ff_links)
@@ -472,6 +534,40 @@ def self_test():
     )
     assert "No link differences found." in slash_report
 
+    # A bookmark filed only under ☁️/👤 in one browser and under a real
+    # category in the other is present in both: it must not be reported as a
+    # difference (the SubnetMonkey case -- Chromium keeps it in 👤 Personal).
+    hidden_only = build_report(
+        fake_stats,
+        [],
+        [],
+        fake_stats,
+        [],
+        [("https://sub.net", "Sub", "Cat")],
+        {"https://sub.net"},
+        {"https://sub.net"},
+    )
+    assert "No link differences found." in hidden_only
+
+    # Firefox smart bookmarks (`place:`) are not navigable URLs; they never
+    # belong in the "only in one browser" table.
+    assert not is_navigable("place:type=6&sort=14&maxResults=10")
+    assert not is_navigable("about:config")
+    assert not is_navigable("moz-extension://abc/page.html")
+    assert is_navigable("https://example.com")
+    assert is_navigable("file:///home/d7/x")
+    smart_report = build_report(
+        fake_stats,
+        [],
+        [],
+        fake_stats,
+        [],
+        [("place:type=6&sort=14&maxResults=10", "Recent Tags", "")],
+        set(),
+        {"place:type=6&sort=14&maxResults=10"},
+    )
+    assert "No link differences found." in smart_report
+
     print("SelfTest OK")
 
 
@@ -506,13 +602,22 @@ def main():
     print(f"  Found Firefox ({firefox_profile})")
 
     print("Reading bookmarks...")
-    chromium_folders, chromium_links = get_chromium_tree(chromium_path)
-    firefox_folders, firefox_links = get_firefox_tree(firefox_db)
+    chromium_folders, chromium_links, chromium_presence = get_chromium_tree(chromium_path)
+    firefox_folders, firefox_links, firefox_presence = get_firefox_tree(firefox_db)
 
     chromium_stats = stats(f"{chromium_name} ({chromium_profile})", chromium_path, chromium_folders, chromium_links)
     firefox_stats = stats(f"Firefox ({firefox_profile})", firefox_db, firefox_folders, firefox_links)
 
-    report = build_report(chromium_stats, chromium_folders, chromium_links, firefox_stats, firefox_folders, firefox_links)
+    report = build_report(
+        chromium_stats,
+        chromium_folders,
+        chromium_links,
+        firefox_stats,
+        firefox_folders,
+        firefox_links,
+        chromium_presence,
+        firefox_presence,
+    )
     Path(args.out).write_text(report, encoding="utf-8")
     print(f"Wrote {args.out}")
 
